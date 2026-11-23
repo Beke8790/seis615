@@ -1,0 +1,59 @@
+Requirement,Status,Evidence,Notes
+AWS context (account/region/identity),PASS,Account 507861383653; arn:aws:iam::507861383653:user/cloudadmin; us-east-1,Preflight discovery via aws sts get-caller-identity and aws configure get region
+Local workspace boundary,PASS,All inspected files under C:\Users\lesib\source\seis615\cafe-app; key pair used from allowed path C:\Users\lesib\OneDrive\Desktop\615\cafe-app-nova.pem,No out-of-scope file access
+Local artifacts inventory,PASS,web_app: aws.phar(58884216) aws.zip(8337674) cafe.zip(5617282) setup.zip(1866) install-basic.sh(569) README.md cafe-app-additional-permissions.json; db_app: db.zip(2794),Required web and db artifacts present
+VPC/network baseline,PASS,"VPC vpc-05f63ca58ce148f76 (10.20.0.0/16) available; public subnets subnet-0383ee5156c876330 us-east-1a, subnet-0dc9dc6f8227dbaeb us-east-1b; private subnets subnet-00fdcb16d55352eaf us-east-1a, subnet-05a30d6a2b3aa63ef us-east-1b; IGW/NAT/routes present per cafe-app-stack",Existing baseline reused
+Security groups,PASS,"cafe-app-sg sg-0da28cda028bbde1e: 22/tcp from 73.65.59.146/32, 80/tcp from 0.0.0.0/0; cafe-db-sg sg-0cdf59dfcf45f58b8: 3306/tcp from sg-0da28cda028bbde1e only, no public 3306",Least-exposure DB rule satisfied
+IAM role/instance profile,PASS,cafe-app-role instance profile/role present; inline policies cafe-app-rolePolicy and CafeAgentOrchestrationAccess include Secrets Manager/S3/EC2 actions; elastic-webserver-role used by ASG instances and updated with CafeDbPasswordRead for /cafe/* GetSecretValue/DescribeSecret,cafe-app EC2 not SSM Online in describe-instance-information; IAM profile attached
+EC2 web application instance,PASS,cafe-app i-0ff039f704dae0bac running t3.medium us-east-1a subnet-0383ee5156c876330 public 34.205.252.20 private 10.20.1.122 key cafe-app-nova profile cafe-app-role SG sg-0da28cda028bbde1e,Reused existing instance; HTTP reachable
+RDS MariaDB private instance,PASS,cafe-db available mariadb 10.6.25 db.t3.micro gp2 20GB MultiAZ true PubliclyAccessible false endpoint cafe-db.cq3mm8oqk0i0.us-east-1.rds.amazonaws.com:3306 DBName cafe_db subnet group private subnets us-east-1a/1b SG sg-0cdf59dfcf45f58b8,Matches required private/MultiAZ configuration
+Secrets Manager password source /cafe/dbPassword,PASS,Secret /cafe/dbPassword exists (arn:aws:secretsmanager:us-east-1:507861383653:secret:/cafe/dbPassword-0LyRuk); related /cafe secrets present; no secret values exposed in logs/report,Metadata verified only
+Web app deployment on EC2,PASS,http://34.205.252.20/cafe/ returned HTTP 200; app files present on ASG instances under /var/www/html/cafe (SSM verification),Standalone EC2 and ASG instances serve app
+Database import/connectivity and cafe_db validation,PASS,"===SHOW_DATABASES===
+SHOW DATABASES;
+Database
+cafe_db
+information_schema
+innodb
+mysql
+performance_schema
+sys
+
+===SHOW_TABLES===
+USE cafe_db; SHOW TABLES;
+Tables_in_cafe_db
+order
+order_item
+product
+product_group
+
+===COUNTS===
+SELECT COUNT(*) AS product_count FROM product;
+product_count
+9
+SELECT COUNT(*) AS product_group_count FROM product_group;
+product_group_count
+2
+SELECT COUNT(*) AS order_count FROM `order`;
+order_count
+2
+SELECT COUNT(*) AS order_item_count FROM order_item;
+order_item_count
+2
+
+===ORDER_COLUMNS===
+SHOW COLUMNS FROM `order`;
+Field	Type	Null	Key	Default	Extra
+order_number	int(5)	NO	PRI	NULL	auto_increment
+order_date_time	timestamp	NO		current_timestamp()	
+amount	decimal(10,2)	NO		0.00	
+
+===ORDER_BY_DATE===
+SELECT DATE(order_date_time) AS order_date, COUNT(*) AS order_entries FROM `order` GROUP BY DATE(order_date_time) ORDER BY order_date DESC LIMIT 10;
+order_date	order_entries
+2026-11-22	2
+
+RDS TCP 3306 reachable from ASG instance (TCP_OK); DB-backed pages HTTP 200.",Validated via SSM on i-005e4f0a160562372; DB password retrieved at runtime from /cafe/dbPassword (not exposed); idempotent run - no dump re-import
+App-to-DB integration via Secrets Manager,PASS,"/var/www/html/cafe/getAppParameters.php retrieves /cafe/dbUrl,/cafe/dbUser,/cafe/dbPassword,/cafe/dbName,/cafe/currency,/cafe/timeZone,/cafe/showServerInfo via AWS SDK; ASG role granted /cafe/* read to fix 500; menu.php 200 after fix",No secrets printed
+HTTP and DB-backed application tests,PASS,ALB http://cafe-app-alb-148142609.us-east-1.elb.amazonaws.com/cafe/ 200; /cafe/menu.php 200; standalone EC2 /cafe/ 200 /cafe/menu.php 200; SSM localhost menu.php 200 on i-005e4f0a160562372 and i-0a1d843d5359e4147,End-to-end functional validation passed
+Final validation report,PASS,Generated cafe-app/overall_execution_result.csv and updated cafe-app/validation_imports.csv,Execution evidence captured without secrets

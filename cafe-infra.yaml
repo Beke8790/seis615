@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cafe application infrastructure - VPC, network, security groups, EC2 web app, and private RDS MariaDB.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair name.
+  MyIpCidr:
+    Type: String
+    Description: Administrator CIDR for SSH access.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  DBName:
+    Type: String
+    Default: cafe_db
+    Description: Initial RDS database name.
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    Description: RDS master username.
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: RDS master password. Supplied securely at deploy time; never stored in template.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type.
+  InstanceProfileName:
+    Type: String
+    Default: cafe-app-role
+    Description: Existing IAM instance profile name to reuse.
+
+Mappings: {}
+
+Resources:
+  CafeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: cafe-app-vpc
+
+  CafeInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cafe-app-igw
+
+  CafeVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref CafeVPC
+      InternetGatewayId: !Ref CafeInternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cafe-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.20.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cafe-public-subnet-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.20.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: cafe-private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.20.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: cafe-private-subnet-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CafeVPC
+      Tags:
+        - Key: Name
+          Value: cafe-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: CafeVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref CafeInternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: CafeVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: cafe-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: cafe-nat-gateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CafeVPC
+      Tags:
+        - Key: Name
+          Value: cafe-private-rt
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  CafeAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from admin IP and HTTP from internet for cafe-app
+      GroupName: cafe-app-sg
+      VpcId: !Ref CafeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIpCidr
+          Description: SSH from approved admin IP
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound
+      Tags:
+        - Key: Name
+          Value: cafe-app-sg
+
+  CafeDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MariaDB access from cafe web app security group
+      GroupName: cafe-db-sg
+      VpcId: !Ref CafeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref CafeAppSecurityGroup
+          Description: MariaDB from cafe-app-sg
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound
+      Tags:
+        - Key: Name
+          Value: cafe-db-sg
+
+  CafeDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for Cafe RDS
+      DBSubnetGroupName: cafe-db-subnet-group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: cafe-db-subnet-group
+
+  CafeRdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DBInstanceIdentifier: cafe-db
+      DBName: !Ref DBName
+      Engine: mariadb
+      EngineVersion: '10.6.25'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      StorageType: gp2
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      MultiAZ: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref CafeDbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref CafeDbSecurityGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: cafe-db
+
+  CafeAppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref InstanceProfileName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref CafeAppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-app
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd php php-mysqlnd mariadb105 unzip
+          systemctl enable httpd
+          systemctl start httpd
+          systemctl enable mariadb || true
+
+Outputs:
+  VpcId:
+    Value: !Ref CafeVPC
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+  CafeAppSecurityGroupId:
+    Value: !Ref CafeAppSecurityGroup
+  CafeDbSecurityGroupId:
+    Value: !Ref CafeDbSecurityGroup
+  CafeAppInstanceId:
+    Value: !Ref CafeAppInstance
+  CafeAppPublicIp:
+    Value: !GetAtt CafeAppInstance.PublicIp
+  CafeAppPrivateIp:
+    Value: !GetAtt CafeAppInstance.PrivateIp
+  CafeRdsEndpoint:
+    Value: !GetAtt CafeRdsInstance.Endpoint.Address
+  CafeRdsPort:
+    Value: !GetAtt CafeRdsInstance.Endpoint.Port
+  CafeDbSubnetGroupName:
+    Value: !Ref CafeDbSubnetGroup

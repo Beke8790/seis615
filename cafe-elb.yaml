@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cafe application ELB/HA automation - ALB, target group, launch template, Auto Scaling Group, and scaling policy on existing cafe-app-vpc baseline.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing Cafe VPC ID.
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet 1 ID for the ALB.
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet 2 ID for the ALB.
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing private subnet 1 ID for ASG instances.
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing private subnet 2 ID for ASG instances.
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Existing app/web security group ID. ALB ingress on port 80 is added to this group.
+  InstanceProfileName:
+    Type: String
+    Default: cafe-app-role
+    Description: Existing IAM instance profile name for launch template instances.
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafe-app-nova
+    Description: Existing EC2 key pair name.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type for ASG instances.
+  HealthCheckPath:
+    Type: String
+    Default: /cafe/
+    Description: Target group HTTP health check path. Use /cafe/ or / depending on app deployment.
+
+Resources:
+  CafeAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from internet to Cafe ALB
+      GroupName: cafe-alb-sg
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound
+      Tags:
+        - Key: Name
+          Value: cafe-alb-sg
+
+  CafeAppIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref CafeAlbSecurityGroup
+      Description: HTTP from Cafe ALB
+
+  CafeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cafe-app-tg
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      Matcher:
+        HttpCode: '200-399'
+      Tags:
+        - Key: Name
+          Value: cafe-app-tg
+
+  CafeApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cafe-app-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      SecurityGroups:
+        - !Ref CafeAlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-app-alb
+
+  CafeAlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref CafeApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref CafeTargetGroup
+
+  CafeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: cafe-app-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        SecurityGroupIds:
+          - !Ref AppSecurityGroupId
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: cafe-app-asg-instance
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            dnf update -y
+            dnf install -y httpd php php-mysqlnd mariadb105 unzip awscli
+            systemctl enable httpd
+            systemctl start httpd
+            # Application artifacts and Secrets Manager integration must be deployed securely.
+            # Do not embed secrets in user data. Use approved artifact transfer and /cafe/dbPassword.
+            echo '<html><body><h1>Cafe app instance</h1><p>Provisioned by cafe-elb CloudFormation.</p></body></html>' > /var/www/html/index.html
+
+  CafeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: cafe-app-asg
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref CafeLaunchTemplate
+        Version: !GetAtt CafeLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      DesiredCapacity: '2'
+      MaxSize: '6'
+      TargetGroupARNs:
+        - !Ref CafeTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: cafe-app-asg-instance
+          PropagateAtLaunch: true
+
+  CafeCpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref CafeAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 25.0
+        DisableScaleIn: false
+
+Outputs:
+  CafeAlbSecurityGroupId:
+    Description: Security group ID for the Cafe ALB.
+    Value: !Ref CafeAlbSecurityGroup
+  CafeTargetGroupArn:
+    Description: ARN of the Cafe target group.
+    Value: !Ref CafeTargetGroup
+  CafeAlbArn:
+    Description: ARN of the Cafe Application Load Balancer.
+    Value: !Ref CafeApplicationLoadBalancer
+  CafeAlbDnsName:
+    Description: DNS name of the Cafe Application Load Balancer.
+    Value: !GetAtt CafeApplicationLoadBalancer.DNSName
+  CafeAlbListenerArn:
+    Description: ARN of the HTTP listener.
+    Value: !Ref CafeAlbListenerHttp
+  CafeLaunchTemplateId:
+    Description: Launch template ID.
+    Value: !Ref CafeLaunchTemplate
+  CafeAutoScalingGroupName:
+    Description: Auto Scaling Group name.
+    Value: !Ref CafeAutoScalingGroup
+  CafeScalingPolicyArn:
+    Description: Target tracking scaling policy ARN.
+    Value: !Ref CafeCpuTargetTrackingPolicy
